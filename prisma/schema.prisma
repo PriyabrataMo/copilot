@@ -1,0 +1,52 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+model Conversation {
+  id              String    @id @default(auto()) @map("_id") @db.ObjectId
+  conversationId  String    @unique
+  title           String?
+  model           String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  messages        Message[]
+}
+
+model Message {
+  id               String        @id @default(auto()) @map("_id") @db.ObjectId
+  messageId        String        @unique
+  conversationId   String
+  role             Role
+  content          String
+  status           MessageStatus @default(COMPLETE)
+  parentId         String?       // Links assistant message to a user message
+  variantIndex     Int?          // Position in a set of regenerations (0, 1, 2...)
+  finishReason     String?
+  model            String?
+  promptTokens     Int?
+  completionTokens Int?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  conversation Conversation @relation(fields: [conversationId], references: [id])
+}
+
+enum Role {
+  USER
+  ASSISTANT
+  SYSTEM
+}
+
+enum MessageStatus {
+  STREAMING
+  COMPLETE
+  INTERRUPTED
+  ERROR
+}
+
+
