@@ -1,6 +1,6 @@
 "use client";
 import { Sidebar } from "@/src/components/Sidebar";
-import { EnhancedChat } from "@/src/components/EnhancedChat";
+import { BranchingChat } from "@/src/components/BranchingChat";
 import { useParams, useRouter, notFound } from "next/navigation";
 import { useEffect, useState } from "react";
 
@@ -104,7 +104,7 @@ export default function ConversationPage() {
         onTitleUpdate={handleTitleUpdate}
       />
       <div className="flex-1">
-        <EnhancedChat conversationId={conversationId} onTitleUpdate={handleTitleUpdate} />
+        <BranchingChat conversationId={conversationId} onTitleUpdate={handleTitleUpdate} />
       </div>
     </div>
   );

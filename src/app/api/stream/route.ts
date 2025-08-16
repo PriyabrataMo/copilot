@@ -13,9 +13,11 @@ type Body = {
   userMessage: string;
   model?: ChatModelId;
   systemPrompt?: string;
-  parentId?: string | null; // parent user message id
+  parentUserMessageId?: string | null; // parent user message id (for assistant responses)
+  userMessageParentId?: string | null; // parent id for user message versioning (edits)
   variantIndex?: number; // which variant this is (0, 1, 2...)
   isRegeneration?: boolean;
+  isEditedPrompt?: boolean; // true when editing a user message
 };
 
 function sseChunk(event: string, data: unknown): string {
@@ -24,7 +26,17 @@ function sseChunk(event: string, data: unknown): string {
 
 export async function POST(req: NextRequest) {
   try {
-    const { conversationId, userMessage, model, systemPrompt, parentId, variantIndex = 0, isRegeneration = false }: Body = await req.json();
+    const { 
+      conversationId, 
+      userMessage, 
+      model, 
+      systemPrompt, 
+      parentUserMessageId, 
+      userMessageParentId,
+      variantIndex = 0, 
+      isRegeneration = false,
+      isEditedPrompt = false
+    }: Body = await req.json();
     
     if (!process.env.OPENAI_API_KEY) {
       return new Response(sseChunk("error", { message: "OpenAI API key not configured" }), {
@@ -44,10 +56,31 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  // Persist the new user message, unless this is a regeneration
-  let userMessageId = parentId;
+  // Handle user message creation/versioning
+  let userMessageId = parentUserMessageId;
+  
   if (!isRegeneration) {
+    // Create new user message (either fresh or edited version)
     userMessageId = uuidv4();
+    
+    // If editing an existing prompt, cancel any active streams for the old version
+    if (isEditedPrompt && userMessageParentId) {
+      streamRegistry.stop(conversationId);
+      
+      // Mark any streaming assistant messages as interrupted
+      await prisma.message.updateMany({
+        where: {
+          conversationId: conv.id,
+          parentId: userMessageParentId,
+          status: "STREAMING"
+        },
+        data: {
+          status: "INTERRUPTED",
+          finishReason: "user_edited_prompt"
+        }
+      });
+    }
+    
     await prisma.message.create({
       data: {
         messageId: userMessageId,
@@ -55,6 +88,7 @@ export async function POST(req: NextRequest) {
         role: "USER",
         content: userMessage,
         status: "COMPLETE",
+        parentId: userMessageParentId, // Link to previous version if editing
       },
     });
   }
