@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
 import OpenAI from "openai";
+import { Prisma } from "@prisma/client";
 import { prisma } from "@/src/lib/prisma";
 import { v4 as uuidv4 } from "uuid";
 import { DEFAULT_MODEL, getModelInfo, type ChatModelId } from "@/src/lib/models";
@@ -23,6 +24,41 @@ type Body = {
 
 function sseChunk(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+}
+
+// Best-effort parser for model JSON outputs that might include leading noise or be stringified
+function cleanJsonLikeString(text: string): string {
+  let t = (text ?? "").trim();
+  // Strip markdown code fences
+  if (t.startsWith("```")) {
+    const firstNl = t.indexOf("\n");
+    if (firstNl !== -1) t = t.slice(firstNl + 1);
+    if (t.endsWith("```")) t = t.slice(0, -3);
+  }
+  // Drop anything before first JSON bracket
+  const firstObj = t.indexOf("{");
+  const firstArr = t.indexOf("[");
+  const candidates = [firstObj, firstArr].filter((i) => i >= 0);
+  if (candidates.length > 0) {
+    const first = Math.min(...candidates);
+    if (first > 0) t = t.slice(first);
+  }
+  return t.trim();
+}
+
+function tryParseJsonLoose(text: string): unknown | null {
+  const cleaned = cleanJsonLikeString(text);
+  try {
+    return cleaned ? JSON.parse(cleaned) : null;
+  } catch {}
+  // If the model returned a quoted JSON string, try to unquote and parse again
+  if ((cleaned.startsWith('"') && cleaned.endsWith('"')) || (cleaned.startsWith("'") && cleaned.endsWith("'"))) {
+    try {
+      const unquoted = cleaned.slice(1, -1);
+      return JSON.parse(unquoted.replace(/\\n/g, "\n").replace(/\\\"/g, '"'));
+    } catch {}
+  }
+  return null;
 }
 
 export async function POST(req: NextRequest) {
@@ -238,6 +274,81 @@ export async function POST(req: NextRequest) {
           } catch (err) {
             console.error("Title generation failed:", err);
           }
+        }
+
+        // Stage 1: Structured data extraction
+        try {
+          controllerStream.enqueue(new TextEncoder().encode(sseChunk("status", { stage: 1, status: "start", message: "interpreting query" })));
+          const stage1System = "You are a data agent. Extract structured data relevant to the user's query. Respond with STRICT valid JSON only.";
+          const stage1User = `User query: ${userMessage}\n\nIf possible, return a concise structured representation. Output format:\n{\n  \"structured_data\": <JSON value: array of objects or object>,\n  \"notes\": <optional string>\n}`;
+          const stage1 = await openai.chat.completions.create({
+            model: chosenModel,
+            messages: [
+              { role: "system", content: stage1System },
+              { role: "user", content: stage1User },
+            ],
+            max_tokens: 512,
+            temperature: 0.2,
+          });
+          const stage1Text = stage1.choices?.[0]?.message?.content?.trim() ?? "";
+          let structured: Prisma.InputJsonValue | null = null;
+          const parsed1 = tryParseJsonLoose(stage1Text);
+          if (parsed1 && typeof parsed1 === "object") {
+            // If structured_data is a nested JSON string, parse it
+            const maybeObj = parsed1 as Record<string, unknown>;
+            if (typeof maybeObj["structured_data"] === "string") {
+              const inner = tryParseJsonLoose(String(maybeObj["structured_data"]));
+              if (inner !== null) {
+                maybeObj["structured_data"] = inner as unknown;
+              }
+            }
+            structured = maybeObj as unknown as Prisma.InputJsonValue;
+          } else {
+            console.warn("Stage 1 JSON parse failed, storing raw text");
+            structured = { structured_data: stage1Text } as unknown as Prisma.InputJsonValue;
+          }
+          controllerStream.enqueue(new TextEncoder().encode(sseChunk("structured_data", structured)));
+          await prisma.message.update({
+            where: { messageId: assistantMessageId },
+            data: { structuredData: structured },
+          });
+          controllerStream.enqueue(new TextEncoder().encode(sseChunk("status", { stage: 1, status: "complete" })));
+
+          // Stage 2: Visualization generation using provided template
+          controllerStream.enqueue(new TextEncoder().encode(sseChunk("status", { stage: 2, status: "start", message: "evaluating visualizations" })));
+          const isRecord = (v: unknown): v is Record<string, unknown> =>
+            typeof v === "object" && v !== null && !Array.isArray(v);
+          const structuredForPrompt = isRecord(structured) && "structured_data" in structured
+            ? (structured as Record<string, unknown>)["structured_data"]
+            : structured;
+          const visTemplate = `You are an expert data visualizer specializing in Plotly. Decide whether visualization is useful for the user question. If yes, construct Plotly figures and return their JSON specs.\n\nSTRICT RULES:\n- Do NOT return Python code.\n- Return ONLY valid JSON as the final answer.\n- If you create figures, build direct Plotly JSON specs (objects with {data, layout, config}) and include them in an array as JSON-serialized strings.\n- Use sensible titles, labels, and percentages where appropriate.\n- If visualization is NOT useful, return an empty array.\n\nUser question context data:\n<data>\n${JSON.stringify(structuredForPrompt)}\n</data>\n\nOutput format (valid JSON, no code fences):\n{\n  \"user_query_specific_plotly_visualisations\": null,\n  \"generic_plotly_visualisations\": null,\n  \"plotly_figure_jsons\": [\"<fig1 as JSON string>", \"<fig2 as JSON string>\"]\n}`;
+          const stage2 = await openai.chat.completions.create({
+            model: chosenModel,
+            messages: [
+              { role: "system", content: "You only output valid JSON as specified." },
+              { role: "user", content: visTemplate },
+            ],
+            max_tokens: 1024,
+            temperature: 0.3,
+          });
+          const stage2Text = stage2.choices?.[0]?.message?.content?.trim() ?? "";
+          let visConfig: Prisma.InputJsonValue | null = null;
+          const parsed2 = tryParseJsonLoose(stage2Text);
+          if (parsed2 && typeof parsed2 === "object") {
+            visConfig = parsed2 as unknown as Prisma.InputJsonValue;
+          } else {
+            console.warn("Stage 2 JSON parse failed, storing raw text");
+            visConfig = { raw: stage2Text } as unknown as Prisma.InputJsonValue;
+          }
+          await prisma.message.update({
+            where: { messageId: assistantMessageId },
+            data: { visualizationConfig: visConfig },
+          });
+          controllerStream.enqueue(new TextEncoder().encode(sseChunk("viz_config", visConfig ?? {})));
+          controllerStream.enqueue(new TextEncoder().encode(sseChunk("status", { stage: 2, status: "complete" })));
+        } catch (pipelineErr) {
+          console.error("Pipeline error:", pipelineErr);
+          controllerStream.enqueue(new TextEncoder().encode(sseChunk("status", { stage: "pipeline", status: "error" })));
         }
 
         streamRegistry.clear(conversationId);

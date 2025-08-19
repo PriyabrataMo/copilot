@@ -30,6 +30,9 @@ model Message {
   model            String?
   promptTokens     Int?
   completionTokens Int?
+  // Stage outputs for two-stage pipeline (optional)
+  structuredData   Json?
+  visualizationConfig Json?
   createdAt        DateTime      @default(now())
   updatedAt        DateTime      @updatedAt
 

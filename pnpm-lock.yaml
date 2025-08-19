@@ -20,6 +20,9 @@ importers:
       openai:
         specifier: ^4.55.0
         version: 4.104.0(zod@3.25.76)
+      plotly.js-dist-min:
+        specifier: ^2.35.2
+        version: 2.35.3
       react:
         specifier: 19.1.0
         version: 19.1.0
@@ -1969,6 +1972,9 @@ packages:
 
   pkg-types@2.2.0:
     resolution: {integrity: sha512-2SM/GZGAEkPp3KWORxQZns4M+WSeXbC2HEvmOIJe3Cmiv6ieAJvdVhDldtHqM5J1Y7MrR1XhkBT/rMlhh9FdqQ==}
+
+  plotly.js-dist-min@2.35.3:
+    resolution: {integrity: sha512-sz2HLP8gkysLx/BanM2PtJTtZ1PLPwdHwMWNri2YxLBy3IOeuDsVQtlmWa4hoK3j/fi4naaD3uZJqH5ozM3zGg==}
 
   possible-typed-array-names@1.1.0:
     resolution: {integrity: sha512-/+5VFTchJDoVj3bhoqi6UeymcD00DAwb1nJwamzPvHEszJ4FpF6SNNbUbOS8yI56qHzdV8eK0qEfOSiodkTdxg==}
@@ -4596,6 +4602,8 @@ snapshots:
       confbox: 0.2.2
       exsolve: 1.0.7
       pathe: 2.0.3
+
+  plotly.js-dist-min@2.35.3: {}
 
   possible-typed-array-names@1.1.0: {}
 

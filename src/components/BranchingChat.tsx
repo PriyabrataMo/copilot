@@ -5,6 +5,7 @@ import remarkGfm from "remark-gfm";
 import { ChatInput } from "./ChatInput";
 import { MODELS, type ChatModelId, DEFAULT_MODEL } from "@/src/lib/models";
 import { useChatStore } from "@/src/lib/chat-store";
+import { PlotlyRenderer } from "./PlotlyRenderer";
 
 type Message = {
   messageId: string;
@@ -15,6 +16,9 @@ type Message = {
   variantIndex?: number | null;
   model?: string | null;
   createdAt: string;
+  structuredData?: unknown;
+  visualizationConfig?: unknown;
+  pipelineStatus?: string;
 };
 
 type Conversation = {
@@ -445,10 +449,38 @@ export function BranchingChat({
                       </ReactMarkdown>
                     </div>
 
+                    {/* Structured data preview */}
+                    {!!currentAssistant.structuredData && (
+                      <div className="mt-3 text-xs">
+                        <details>
+                          <summary className="cursor-pointer text-gray-600">Structured data</summary>
+                          <pre className="mt-2 whitespace-pre-wrap break-words bg-white p-2 rounded border text-gray-800">
+                            {JSON.stringify(currentAssistant.structuredData, null, 2)}
+                          </pre>
+                        </details>
+                      </div>
+                    )}
+
+                    {/* Render Plotly figures if present */}
+                    {(() => {
+                      const cfg = currentAssistant.visualizationConfig as
+                        | { plotly_figure_jsons?: string[] }
+                        | undefined;
+                      const list: string[] = Array.isArray(cfg?.plotly_figure_jsons)
+                        ? (cfg?.plotly_figure_jsons as string[])
+                        : [];
+                      if (list.length === 0) return null;
+                      return (
+                        <div className="mt-4">
+                          <PlotlyRenderer figures={list} />
+                        </div>
+                      );
+                    })()}
+
                     {currentAssistant.status === "STREAMING" && (
                       <div className="mt-2 text-xs text-gray-500">
                         <span className="inline-block w-2 h-2 bg-current rounded-full animate-pulse mr-1"></span>
-                        Thinking...
+                        {currentAssistant.pipelineStatus || "Thinking..."}
                       </div>
                     )}
 

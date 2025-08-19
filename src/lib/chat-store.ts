@@ -12,6 +12,9 @@ export type ChatMessage = {
   variantIndex?: number | null;
   model?: string | null;
   createdAt: string;
+  structuredData?: unknown;
+  visualizationConfig?: unknown;
+  pipelineStatus?: string;
 };
 
 export type Conversation = {
@@ -260,6 +263,72 @@ export const useChatStore = create<ChatState>((set, get) => ({
                     ...s.messagesById,
                     [body.conversationId]: byId,
                   },
+                };
+              });
+            } else if (event === "status") {
+              const assistantId = get().currentAssistantId[body.conversationId];
+              if (!assistantId) return;
+              set((s) => {
+                const list = s.messages[body.conversationId] ?? [];
+                const idxMap = s.messageIndex[body.conversationId] ?? {};
+                const i = idxMap[assistantId];
+                if (i === undefined) return {} as ChatState;
+                const target = list[i];
+                const label = (() => {
+                  const stage = data.stage;
+                  const status = data.status;
+                  const msg = data.message;
+                  if (typeof stage !== "undefined") {
+                    return `Stage ${stage}: ${status}${msg ? ` - ${msg}` : ""}`;
+                  }
+                  return typeof status === "string" ? status : "";
+                })();
+                const updated: ChatMessage = { ...target, pipelineStatus: label };
+                const updatedList = [...list];
+                updatedList[i] = updated;
+                const byId = { ...(s.messagesById[body.conversationId] ?? {}) };
+                byId[assistantId] = updated;
+                return {
+                  messages: { ...s.messages, [body.conversationId]: updatedList },
+                  messagesById: { ...s.messagesById, [body.conversationId]: byId },
+                };
+              });
+            } else if (event === "structured_data") {
+              const assistantId = get().currentAssistantId[body.conversationId];
+              if (!assistantId) return;
+              set((s) => {
+                const list = s.messages[body.conversationId] ?? [];
+                const idxMap = s.messageIndex[body.conversationId] ?? {};
+                const i = idxMap[assistantId];
+                if (i === undefined) return {} as ChatState;
+                const target = list[i];
+                const updated: ChatMessage = { ...target, structuredData: data };
+                const updatedList = [...list];
+                updatedList[i] = updated;
+                const byId = { ...(s.messagesById[body.conversationId] ?? {}) };
+                byId[assistantId] = updated;
+                return {
+                  messages: { ...s.messages, [body.conversationId]: updatedList },
+                  messagesById: { ...s.messagesById, [body.conversationId]: byId },
+                };
+              });
+            } else if (event === "viz_config") {
+              const assistantId = get().currentAssistantId[body.conversationId];
+              if (!assistantId) return;
+              set((s) => {
+                const list = s.messages[body.conversationId] ?? [];
+                const idxMap = s.messageIndex[body.conversationId] ?? {};
+                const i = idxMap[assistantId];
+                if (i === undefined) return {} as ChatState;
+                const target = list[i];
+                const updated: ChatMessage = { ...target, visualizationConfig: data };
+                const updatedList = [...list];
+                updatedList[i] = updated;
+                const byId = { ...(s.messagesById[body.conversationId] ?? {}) };
+                byId[assistantId] = updated;
+                return {
+                  messages: { ...s.messages, [body.conversationId]: updatedList },
+                  messagesById: { ...s.messagesById, [body.conversationId]: byId },
                 };
               });
             } else if (event === "end") {
