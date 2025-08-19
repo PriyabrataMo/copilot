@@ -1,0 +1,61 @@
+sequenceDiagram
+  autonumber
+  participant U as "User"
+  participant UI as "BranchingChat (React)"
+  participant Store as "Zustand useChatStore"
+  participant API as "API /api/stream"
+  participant Reg as "StreamRegistry"
+  participant DB as "Prisma (MongoDB)"
+  participant OA as "OpenAI"
+
+  U->>UI: Type message
+  UI->>Store: openStream(conversationId, userMessage, model)
+  Store->>API: POST /api/stream (SSE)
+  API->>DB: Find conversation by conversationId
+  alt New user turn
+    API->>DB: Create USER message (COMPLETE)
+  else Regeneration
+    API->>API: Use parentUserMessageId
+  end
+  API->>DB: Create ASSISTANT placeholder (STREAMING)
+  API->>Reg: set AbortController
+  API-->>Store: SSE start {conversationId, assistantId, parentId, model}
+  Store->>Store: Save currentAssistantId and add placeholders
+  loop Stream tokens
+    OA-->>API: delta
+    API-->>Store: SSE token {token}
+    Store->>Store: Append token to assistant content
+    API->>DB: Periodically save partial content
+  end
+  API-->>Store: SSE finish
+  API->>DB: Update ASSISTANT to COMPLETE
+  API->>Reg: clear controller
+  Store->>Store: Mark isStreaming false and loadConversation
+
+  Note over UI,Store: Navigation away and return
+  UI->>Store: loadConversation(conversationId)
+  Store->>API: GET /api/conversations/:id/messages
+  API->>DB: Fetch messages
+  DB-->>API: messages
+  API-->>Store: messages JSON
+  Store->>Store: Merge with local currentAssistantId and prefer longer content
+
+  Note over U,API: Stop / cancel
+  U->>Store: stopStream(conversationId)
+  Store->>API: POST /api/stop
+  API->>Reg: Abort controller
+  API-->>Store: SSE end {interrupted}
+  API->>DB: Save accumulated content and mark INTERRUPTED
+
+  Note over UI,API: Edited prompt
+  UI->>Store: openStream(isEditedPrompt, userMessageParentId)
+  API->>Reg: stop any active stream
+  API->>DB: Mark previous streaming as INTERRUPTED
+  API->>DB: Create new USER edited message
+  API->>DB: Create new ASSISTANT placeholder
+  API-->>Store: SSE start, token, finish
+
+  Note over UI,API: Regenerate
+  UI->>Store: openStream(isRegeneration, parentUserMessageId, variantIndex)
+  API->>DB: Create new ASSISTANT with same parent and incremented variantIndex
+  API-->>Store: SSE start, token, finish

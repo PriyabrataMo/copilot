@@ -1,9 +1,10 @@
 "use client";
-import React, { useEffect, useState, useRef } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { ChatInput } from "./ChatInput";
 import { MODELS, type ChatModelId, DEFAULT_MODEL } from "@/src/lib/models";
+import { useChatStore } from "@/src/lib/chat-store";
 
 type Message = {
   messageId: string;
@@ -31,32 +32,27 @@ type ConversationTurn = {
   currentAssistantVariant: { [userMessageId: string]: number }; // Current assistant variant per user version
 };
 
-export function BranchingChat({ 
-  conversationId, 
-  onTitleUpdate 
-}: { 
-  conversationId: string; 
-  onTitleUpdate?: (title: string) => void; 
+export function BranchingChat({
+  conversationId,
+  onTitleUpdate,
+}: {
+  conversationId: string;
+  onTitleUpdate?: (title: string) => void;
 }) {
   const [conversation, setConversation] = useState<Conversation | null>(null);
   const [turns, setTurns] = useState<ConversationTurn[]>([]);
   const [activeModel, setActiveModel] = useState<ChatModelId>(DEFAULT_MODEL);
-  const [isStreaming, setIsStreaming] = useState(false);
   const [editingTurnIndex, setEditingTurnIndex] = useState<number | null>(null);
   const [editContent, setEditContent] = useState("");
-  const lastAssistantIdRef = useRef<string | null>(null);
-  const streamConnectionRef = useRef<{ stop: () => void } | null>(null);
+  const store = useChatStore();
+  const isStreaming = !!store.isStreaming[conversationId];
 
   async function loadConversation() {
     try {
-      const res = await fetch(`/api/conversations/${conversationId}/messages`);
-      const data = await res.json();
-      setConversation(data.conversation);
-      setActiveModel((data.conversation?.model ?? DEFAULT_MODEL) as ChatModelId);
-      
-      // Organize messages into conversation turns
-      const conversationTurns = organizeMessagesByTurns(data.messages);
-      setTurns(conversationTurns);
+      await store.loadConversation(conversationId);
+      const conv = store.conversations[conversationId] ?? null;
+      setConversation(conv ?? null);
+      setActiveModel((conv?.model ?? DEFAULT_MODEL) as ChatModelId);
     } catch (error) {
       console.error("Failed to load conversation:", error);
     }
@@ -64,25 +60,36 @@ export function BranchingChat({
 
   function organizeMessagesByTurns(messages: Message[]): ConversationTurn[] {
     const turns: ConversationTurn[] = [];
-    
-    // Group messages by user turns (find root user messages first)
+    const byId = new Map(messages.map((m) => [m.messageId, m] as const));
+    // Root user messages are user messages whose parent is not a user (system or assistant)
     const rootUserMessages = messages
-      .filter(m => m.role === "USER" && !m.parentId)
-      .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+      .filter((m) => m.role === "USER")
+      .filter((m) => {
+        if (!m.parentId) return true;
+        const parent = byId.get(m.parentId);
+        return !parent || parent.role !== "USER";
+      })
+      .sort(
+        (a, b) =>
+          new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+      );
 
     for (const rootUser of rootUserMessages) {
       // Find all versions of this user message (including edits)
       const userVersions = findAllUserVersions(messages, rootUser.messageId);
-      
+
       // Find assistant responses for each user version
       const assistantVariants: { [userMessageId: string]: Message[] } = {};
       const currentAssistantVariant: { [userMessageId: string]: number } = {};
-      
+
       for (const userVersion of userVersions) {
         const assistants = messages
-          .filter(m => m.role === "ASSISTANT" && m.parentId === userVersion.messageId)
+          .filter(
+            (m) =>
+              m.role === "ASSISTANT" && m.parentId === userVersion.messageId
+          )
           .sort((a, b) => (a.variantIndex || 0) - (b.variantIndex || 0));
-        
+
         assistantVariants[userVersion.messageId] = assistants;
         currentAssistantVariant[userVersion.messageId] = 0;
       }
@@ -98,28 +105,36 @@ export function BranchingChat({
     return turns;
   }
 
-  function findAllUserVersions(messages: Message[], rootMessageId: string): Message[] {
+  function findAllUserVersions(
+    messages: Message[],
+    rootMessageId: string
+  ): Message[] {
     const versions: Message[] = [];
     const visited = new Set<string>();
-    
+
     function collectVersions(messageId: string) {
       if (visited.has(messageId)) return;
       visited.add(messageId);
-      
-      const message = messages.find(m => m.messageId === messageId);
+
+      const message = messages.find((m) => m.messageId === messageId);
       if (message && message.role === "USER") {
         versions.push(message);
-        
+
         // Find any messages that have this message as parent (edited versions)
-        const children = messages.filter(m => m.role === "USER" && m.parentId === messageId);
+        const children = messages.filter(
+          (m) => m.role === "USER" && m.parentId === messageId
+        );
         for (const child of children) {
           collectVersions(child.messageId);
         }
       }
     }
-    
+
     collectVersions(rootMessageId);
-    return versions.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+    return versions.sort(
+      (a, b) =>
+        new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime()
+    );
   }
 
   useEffect(() => {
@@ -127,125 +142,34 @@ export function BranchingChat({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId]);
 
-  function connectSSE(body: {
-    conversationId: string;
-    userMessage: string;
-    model: string;
-    parentUserMessageId?: string;
-    userMessageParentId?: string;
-    variantIndex?: number;
-    isRegeneration?: boolean;
-    isEditedPrompt?: boolean;
-  }) {
-    const controller = new AbortController();
-    
-    async function run() {
-      try {
-        setIsStreaming(true);
-        const res = await fetch("/api/stream", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-          signal: controller.signal,
-        });
-        
-        if (!res.ok) {
-          throw new Error(`HTTP ${res.status}`);
-        }
-        
-        const reader = res.body!.getReader();
-        const decoder = new TextDecoder("utf-8");
-        let buffer = "";
-        
-        while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          
-          buffer += decoder.decode(value, { stream: true });
-          let idx;
-          while ((idx = buffer.indexOf("\n\n")) !== -1) {
-            const raw = buffer.slice(0, idx);
-            buffer = buffer.slice(idx + 2);
-            const lines = raw.split("\n");
-            const eventLine = lines.find((l) => l.startsWith("event: "));
-            const dataLine = lines.find((l) => l.startsWith("data: "));
-            const event = eventLine ? eventLine.slice(7) : "message";
-            const data = dataLine ? JSON.parse(dataLine.slice(6)) : {};
-            onEvent(event, data, body);
-          }
-        }
-      } catch (error) {
-        console.error("Stream error:", error);
-        setIsStreaming(false);
-      }
+  const storeMessages = useMemo(
+    () => store.messages[conversationId] ?? [],
+    [store.messages, conversationId]
+  );
+  useEffect(() => {
+    // Organize messages into conversation turns when store updates
+    // Always render full content from store (accumulated tokens)
+    const conversationTurns = organizeMessagesByTurns(
+      storeMessages as unknown as Message[]
+    );
+    setTurns(conversationTurns);
+    const conv = store.conversations[conversationId] ?? null;
+    if (conv) {
+      setConversation(conv);
+      setActiveModel((conv.model ?? DEFAULT_MODEL) as ChatModelId);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [storeMessages]);
 
-    function onEvent(event: string, data: Record<string, unknown>, requestBody: typeof body) {
-      if (event === "start") {
-        lastAssistantIdRef.current = data.messageId as string;
-        
-        // Reload conversation to get updated structure including the new streaming message
-        setTimeout(() => loadConversation(), 100);
-        
-      } else if (event === "token") {
-        setTurns(prev => prev.map(turn => {
-          const newAssistantVariants = { ...turn.assistantVariants };
-          
-          Object.keys(newAssistantVariants).forEach(userMessageId => {
-            newAssistantVariants[userMessageId] = newAssistantVariants[userMessageId].map(msg =>
-              msg.messageId === lastAssistantIdRef.current 
-                ? { ...msg, content: msg.content + (data.delta as string ?? "") }
-                : msg
-            );
-          });
-          
-          return { ...turn, assistantVariants: newAssistantVariants };
-        }));
-        
-      } else if (event === "end") {
-        setTurns(prev => prev.map(turn => {
-          const newAssistantVariants = { ...turn.assistantVariants };
-          
-          Object.keys(newAssistantVariants).forEach(userMessageId => {
-            newAssistantVariants[userMessageId] = newAssistantVariants[userMessageId].map(msg =>
-              msg.messageId === lastAssistantIdRef.current 
-                ? { ...msg, status: data.status === "complete" ? "COMPLETE" : "INTERRUPTED" }
-                : msg
-            );
-          });
-          
-          return { ...turn, assistantVariants: newAssistantVariants };
-        }));
-        setIsStreaming(false);
-        
-      } else if (event === "title") {
-        const newTitle = data.title as string;
-        if (onTitleUpdate) {
-          onTitleUpdate(newTitle);
-        }
-        setConversation(prev => prev ? { ...prev, title: newTitle } : null);
-        
-      } else if (event === "error") {
-        console.error("Stream error:", data);
-        setIsStreaming(false);
-      }
-    }
-
-    run();
-    return { stop: () => controller.abort() };
-  }
+  // Streaming handled by global store
 
   async function handleSendMessage(content: string) {
     if (!content.trim()) return;
-
-    const body = {
+    store.openStream({
       conversationId,
       userMessage: content,
       model: activeModel,
-    };
-
-    const conn = connectSSE(body);
-    streamConnectionRef.current = conn;
+    });
   }
 
   async function handleEditUserMessage(turnIndex: number, newContent: string) {
@@ -253,7 +177,7 @@ export function BranchingChat({
     if (!turn) return;
 
     const currentUserMessage = turn.userVersions[turn.currentUserVersion];
-    
+
     const body = {
       conversationId,
       userMessage: newContent,
@@ -261,13 +185,8 @@ export function BranchingChat({
       userMessageParentId: currentUserMessage.messageId,
       isEditedPrompt: true,
     };
-
     setEditingTurnIndex(null);
-    const conn = connectSSE(body);
-    streamConnectionRef.current = conn;
-    
-    // Reload after a short delay to see the new structure
-    setTimeout(() => loadConversation(), 500);
+    store.openStream(body);
   }
 
   async function handleRegenerateAssistant(turnIndex: number) {
@@ -275,8 +194,9 @@ export function BranchingChat({
     if (!turn) return;
 
     const currentUserMessage = turn.userVersions[turn.currentUserVersion];
-    const currentVariants = turn.assistantVariants[currentUserMessage.messageId] || [];
-    
+    const currentVariants =
+      turn.assistantVariants[currentUserMessage.messageId] || [];
+
     const body = {
       conversationId,
       userMessage: currentUserMessage.content,
@@ -285,56 +205,60 @@ export function BranchingChat({
       variantIndex: currentVariants.length,
       isRegeneration: true,
     };
-
-    const conn = connectSSE(body);
-    streamConnectionRef.current = conn;
+    store.openStream(body);
   }
 
   async function handleStop() {
     try {
-      await fetch("/api/stop", { 
-        method: "POST", 
-        headers: { "Content-Type": "application/json" }, 
-        body: JSON.stringify({ conversationId }) 
-      });
-      if (streamConnectionRef.current) {
-        streamConnectionRef.current.stop();
-      }
+      await store.stopStream(conversationId);
     } catch (error) {
       console.error("Failed to stop stream:", error);
     }
   }
 
   function navigateUserVersion(turnIndex: number, direction: "prev" | "next") {
-    setTurns(prev => prev.map((turn, idx) => {
-      if (idx !== turnIndex) return turn;
-      
-      const newIndex = direction === "prev" 
-        ? Math.max(0, turn.currentUserVersion - 1)
-        : Math.min(turn.userVersions.length - 1, turn.currentUserVersion + 1);
-      
-      return { ...turn, currentUserVersion: newIndex };
-    }));
+    setTurns((prev) =>
+      prev.map((turn, idx) => {
+        if (idx !== turnIndex) return turn;
+
+        const newIndex =
+          direction === "prev"
+            ? Math.max(0, turn.currentUserVersion - 1)
+            : Math.min(
+                turn.userVersions.length - 1,
+                turn.currentUserVersion + 1
+              );
+
+        return { ...turn, currentUserVersion: newIndex };
+      })
+    );
   }
 
-  function navigateAssistantVariant(turnIndex: number, userMessageId: string, direction: "prev" | "next") {
-    setTurns(prev => prev.map((turn, idx) => {
-      if (idx !== turnIndex) return turn;
-      
-      const variants = turn.assistantVariants[userMessageId] || [];
-      const currentIndex = turn.currentAssistantVariant[userMessageId] || 0;
-      const newIndex = direction === "prev" 
-        ? Math.max(0, currentIndex - 1)
-        : Math.min(variants.length - 1, currentIndex + 1);
-      
-      return {
-        ...turn,
-        currentAssistantVariant: {
-          ...turn.currentAssistantVariant,
-          [userMessageId]: newIndex
-        }
-      };
-    }));
+  function navigateAssistantVariant(
+    turnIndex: number,
+    userMessageId: string,
+    direction: "prev" | "next"
+  ) {
+    setTurns((prev) =>
+      prev.map((turn, idx) => {
+        if (idx !== turnIndex) return turn;
+
+        const variants = turn.assistantVariants[userMessageId] || [];
+        const currentIndex = turn.currentAssistantVariant[userMessageId] || 0;
+        const newIndex =
+          direction === "prev"
+            ? Math.max(0, currentIndex - 1)
+            : Math.min(variants.length - 1, currentIndex + 1);
+
+        return {
+          ...turn,
+          currentAssistantVariant: {
+            ...turn.currentAssistantVariant,
+            [userMessageId]: newIndex,
+          },
+        };
+      })
+    );
   }
 
   async function handleModelChange(model: ChatModelId) {
@@ -358,13 +282,15 @@ export function BranchingChat({
           onChange={(e) => handleModelChange(e.target.value as ChatModelId)}
         >
           {MODELS.map((m) => (
-            <option key={m.id} value={m.id}>{m.label}</option>
+            <option key={m.id} value={m.id}>
+              {m.label}
+            </option>
           ))}
         </select>
         <div className="ml-auto flex gap-2">
-          <button 
-            className="px-3 py-1 border rounded text-sm hover:bg-gray-50" 
-            onClick={handleStop} 
+          <button
+            className="px-3 py-1 border rounded text-sm hover:bg-gray-50"
+            onClick={handleStop}
             disabled={!isStreaming}
           >
             {isStreaming ? "Stop" : "Stopped"}
@@ -376,8 +302,10 @@ export function BranchingChat({
       <div className="flex-1 overflow-auto p-4 space-y-6">
         {turns.map((turn, turnIndex) => {
           const currentUserMessage = turn.userVersions[turn.currentUserVersion];
-          const assistantVariants = turn.assistantVariants[currentUserMessage.messageId] || [];
-          const currentAssistantIndex = turn.currentAssistantVariant[currentUserMessage.messageId] || 0;
+          const assistantVariants =
+            turn.assistantVariants[currentUserMessage.messageId] || [];
+          const currentAssistantIndex =
+            turn.currentAssistantVariant[currentUserMessage.messageId] || 0;
           const currentAssistant = assistantVariants[currentAssistantIndex];
 
           return (
@@ -397,11 +325,15 @@ export function BranchingChat({
                           ←
                         </button>
                         <span className="text-xs">
-                          {turn.currentUserVersion + 1}/{turn.userVersions.length}
+                          {turn.currentUserVersion + 1}/
+                          {turn.userVersions.length}
                         </span>
                         <button
                           onClick={() => navigateUserVersion(turnIndex, "next")}
-                          disabled={turn.currentUserVersion === turn.userVersions.length - 1}
+                          disabled={
+                            turn.currentUserVersion ===
+                            turn.userVersions.length - 1
+                          }
                           className="p-1 rounded hover:bg-blue-400 disabled:opacity-50"
                         >
                           →
@@ -409,7 +341,7 @@ export function BranchingChat({
                       </div>
                     )}
                   </div>
-                  
+
                   {editingTurnIndex === turnIndex ? (
                     <div className="space-y-3">
                       <textarea
@@ -420,7 +352,9 @@ export function BranchingChat({
                       />
                       <div className="flex gap-2">
                         <button
-                          onClick={() => handleEditUserMessage(turnIndex, editContent)}
+                          onClick={() =>
+                            handleEditUserMessage(turnIndex, editContent)
+                          }
                           className="px-3 py-1 bg-green-500 text-white rounded text-sm hover:bg-green-600"
                         >
                           Save & Submit
@@ -435,8 +369,10 @@ export function BranchingChat({
                     </div>
                   ) : (
                     <>
-                      <div className="whitespace-pre-wrap">{currentUserMessage.content}</div>
-                      <div className="opacity-0 group-hover:opacity-100 transition-opacity mt-3">
+                      <div className="whitespace-pre-wrap">
+                        {currentUserMessage.content}
+                      </div>
+                      <div className=" transition-opacity mt-3 flex gap-2">
                         <button
                           onClick={() => {
                             setEditingTurnIndex(turnIndex);
@@ -445,6 +381,12 @@ export function BranchingChat({
                           className="text-xs px-2 py-1 bg-blue-400 text-white rounded hover:bg-blue-300"
                         >
                           Edit
+                        </button>
+                        <button
+                          onClick={() => handleRegenerateAssistant(turnIndex)}
+                          className="text-xs px-2 py-1 bg-gray-200 text-gray-700 rounded hover:bg-gray-300"
+                        >
+                          Regenerate
                         </button>
                       </div>
                     </>
@@ -461,18 +403,34 @@ export function BranchingChat({
                       {assistantVariants.length > 1 && (
                         <div className="flex items-center gap-1">
                           <button
-                            onClick={() => navigateAssistantVariant(turnIndex, currentUserMessage.messageId, "prev")}
+                            onClick={() =>
+                              navigateAssistantVariant(
+                                turnIndex,
+                                currentUserMessage.messageId,
+                                "prev"
+                              )
+                            }
                             disabled={currentAssistantIndex === 0}
                             className="p-1 rounded hover:bg-gray-200 disabled:opacity-50"
                           >
                             ←
                           </button>
                           <span className="text-xs">
-                            {currentAssistantIndex + 1}/{assistantVariants.length}
+                            {currentAssistantIndex + 1}/
+                            {assistantVariants.length}
                           </span>
                           <button
-                            onClick={() => navigateAssistantVariant(turnIndex, currentUserMessage.messageId, "next")}
-                            disabled={currentAssistantIndex === assistantVariants.length - 1}
+                            onClick={() =>
+                              navigateAssistantVariant(
+                                turnIndex,
+                                currentUserMessage.messageId,
+                                "next"
+                              )
+                            }
+                            disabled={
+                              currentAssistantIndex ===
+                              assistantVariants.length - 1
+                            }
                             className="p-1 rounded hover:bg-gray-200 disabled:opacity-50"
                           >
                             →
@@ -480,7 +438,7 @@ export function BranchingChat({
                         </div>
                       )}
                     </div>
-                    
+
                     <div className="prose prose-sm max-w-none">
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>
                         {currentAssistant.content}
@@ -494,7 +452,7 @@ export function BranchingChat({
                       </div>
                     )}
 
-                    <div className="opacity-0 group-hover:opacity-100 transition-opacity mt-3 flex gap-2">
+                    <div className=" transition-opacity mt-3 flex gap-2">
                       <button
                         onClick={() => handleRegenerateAssistant(turnIndex)}
                         className="text-xs px-2 py-1 bg-gray-200 text-gray-700 rounded hover:bg-gray-300"
@@ -502,7 +460,11 @@ export function BranchingChat({
                         Regenerate
                       </button>
                       <button
-                        onClick={() => navigator.clipboard.writeText(currentAssistant.content)}
+                        onClick={() =>
+                          navigator.clipboard.writeText(
+                            currentAssistant.content
+                          )
+                        }
                         className="text-xs px-2 py-1 bg-gray-200 text-gray-700 rounded hover:bg-gray-300"
                       >
                         Copy

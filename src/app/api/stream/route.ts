@@ -18,6 +18,7 @@ type Body = {
   variantIndex?: number; // which variant this is (0, 1, 2...)
   isRegeneration?: boolean;
   isEditedPrompt?: boolean; // true when editing a user message
+  parentId?: string | null; // parent id for user message versioning (edits)
 };
 
 function sseChunk(event: string, data: unknown): string {
@@ -26,17 +27,24 @@ function sseChunk(event: string, data: unknown): string {
 
 export async function POST(req: NextRequest) {
   try {
-    const { 
-      conversationId, 
-      userMessage, 
-      model, 
-      systemPrompt, 
-      parentUserMessageId, 
-      userMessageParentId,
-      variantIndex = 0, 
-      isRegeneration = false,
-      isEditedPrompt = false
-    }: Body = await req.json();
+    const raw : Body = await req.json();
+    const conversationId: string = raw.conversationId;
+    const userMessage: string = raw.userMessage;
+    const model: ChatModelId | undefined = raw.model;
+    const systemPrompt: string | undefined = raw.systemPrompt;
+    let parentUserMessageId: string | null | undefined = raw.parentUserMessageId;
+    let userMessageParentId: string | null | undefined = raw.userMessageParentId;
+    const variantIndex: number = raw.variantIndex ?? 0;
+    const isRegeneration: boolean = !!raw.isRegeneration;
+    const isEditedPrompt: boolean = !!raw.isEditedPrompt;
+
+    // Backward-compat: support `parentId` param from older clients
+    if (!parentUserMessageId && raw.parentId && isRegeneration) {
+      parentUserMessageId = raw.parentId as string;
+    }
+    if (!userMessageParentId && raw.parentId && !isRegeneration) {
+      userMessageParentId = raw.parentId as string;
+    }
     
     if (!process.env.OPENAI_API_KEY) {
       return new Response(sseChunk("error", { message: "OpenAI API key not configured" }), {
@@ -56,31 +64,32 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  // Handle user message creation/versioning
+  // Handle user message creation/versioning and parent linkage
   let userMessageId = parentUserMessageId;
-  
   if (!isRegeneration) {
-    // Create new user message (either fresh or edited version)
     userMessageId = uuidv4();
-    
+
+    // Determine the parent for this user message:
+    // - If editing, parent is the previous user message (userMessageParentId)
+    // - Else, parent is the last assistant or system message in the conversation (to build a chain)
+    let parentIdForUser: string | null | undefined = userMessageParentId;
+    if (!parentIdForUser) {
+      const lastNonUser = await prisma.message.findFirst({
+        where: { conversationId: conv.id, OR: [{ role: "ASSISTANT" }, { role: "SYSTEM" }] },
+        orderBy: { createdAt: "desc" },
+      });
+      parentIdForUser = lastNonUser?.messageId ?? null;
+    }
+
     // If editing an existing prompt, cancel any active streams for the old version
     if (isEditedPrompt && userMessageParentId) {
       streamRegistry.stop(conversationId);
-      
-      // Mark any streaming assistant messages as interrupted
       await prisma.message.updateMany({
-        where: {
-          conversationId: conv.id,
-          parentId: userMessageParentId,
-          status: "STREAMING"
-        },
-        data: {
-          status: "INTERRUPTED",
-          finishReason: "user_edited_prompt"
-        }
+        where: { conversationId: conv.id, parentId: userMessageParentId, status: "STREAMING" },
+        data: { status: "INTERRUPTED", finishReason: "user_edited_prompt" },
       });
     }
-    
+
     await prisma.message.create({
       data: {
         messageId: userMessageId,
@@ -88,7 +97,7 @@ export async function POST(req: NextRequest) {
         role: "USER",
         content: userMessage,
         status: "COMPLETE",
-        parentId: userMessageParentId, // Link to previous version if editing
+        parentId: parentIdForUser ?? null,
       },
     });
   }
@@ -98,7 +107,7 @@ export async function POST(req: NextRequest) {
     await prisma.conversation.update({ where: { id: conv.id }, data: { title: userMessage.trim().slice(0, 80) } });
   }
 
-  const chosenModel = (model ?? conv.model ?? DEFAULT_MODEL) as ChatModelId;
+  const chosenModel = (model ?? (conv.model as ChatModelId) ?? DEFAULT_MODEL) as ChatModelId;
   const info = getModelInfo(chosenModel);
 
   // Compose context - get all messages up to this point
@@ -110,7 +119,9 @@ export async function POST(req: NextRequest) {
     role: m.role.toLowerCase() as "user" | "assistant" | "system",
     content: m.content,
   }));
-  const sys = systemPrompt ?? "You are a helpful assistant.";
+  // Use first system message if exists, otherwise fallback
+  const firstSystem = prior.find((m) => m.role === "SYSTEM");
+  const sys = systemPrompt ?? firstSystem?.content ?? "You are a helpful assistant.";
   const { messages, promptTokens, maxCompletionTokens } = buildPrompt(
     chosenModel,
     sys,
@@ -146,9 +157,14 @@ export async function POST(req: NextRequest) {
       controllerStream.enqueue(new TextEncoder().encode(sseChunk("start", {
         conversationId,
         messageId: assistantMessageId,
+        parentId: userMessageId,
+        role: "assistant",
         model: chosenModel,
       })));
 
+      // Hoist accumulated buffers so they are available in all branches
+      let accumulated = "";
+      let completionTokens = 0;
       try {
         const chatStream = await openai.chat.completions.create({
           model: chosenModel,
@@ -156,15 +172,28 @@ export async function POST(req: NextRequest) {
           stream: true,
           max_tokens: Math.max(64, actualMaxTokens),
         }, { signal: controller.signal });
-
-        let accumulated = "";
-        let completionTokens = 0;
+        
+        // Persist partial content to DB periodically to support resume-on-reconnect UX
+        const SAVE_EVERY_N_TOKENS = 5;
         for await (const chunk of chatStream) {
           const delta = chunk.choices?.[0]?.delta?.content ?? "";
           if (delta) {
             accumulated += delta;
             completionTokens += 1;
-            controllerStream.enqueue(new TextEncoder().encode(sseChunk("token", { delta })));
+            // messageId and parentId are not required for the client on token events
+            controllerStream.enqueue(new TextEncoder().encode(sseChunk("token", { token: delta })));
+            // Throttled save of partial content so reconnecting clients see progress
+            if (completionTokens % SAVE_EVERY_N_TOKENS === 0) {
+              try {
+                await prisma.message.update({
+                  where: { messageId: assistantMessageId },
+                  data: { content: accumulated, completionTokens },
+                });
+              } catch (e) {
+                // Non-fatal; continue streaming
+                console.error("Partial save failed:", e);
+              }
+            }
           }
           const finishReason = chunk.choices?.[0]?.finish_reason;
           if (finishReason) {
@@ -219,14 +248,22 @@ export async function POST(req: NextRequest) {
         console.error("Stream error:", err);
         
         if (e?.name === "AbortError") {
-          await prisma.message.update({ where: { messageId: assistantMessageId }, data: { status: "INTERRUPTED", finishReason: "user_cancelled" } });
+          // Save whatever we have accumulated so far before marking interrupted
+          try {
+            await prisma.message.update({
+              where: { messageId: assistantMessageId },
+              data: { content: accumulated, status: "INTERRUPTED", completionTokens, finishReason: "user_cancelled" },
+            });
+          } catch {}
           controllerStream.enqueue(new TextEncoder().encode(sseChunk("end", { status: "interrupted" })));
           controllerStream.close();
           return;
         }
         
         const errorMessage = e?.message || "Unknown error occurred";
-        await prisma.message.update({ where: { messageId: assistantMessageId }, data: { status: "ERROR", finishReason: "error" } });
+        try {
+          await prisma.message.update({ where: { messageId: assistantMessageId }, data: { content: accumulated, status: "ERROR", completionTokens, finishReason: "error" } });
+        } catch {}
         controllerStream.enqueue(new TextEncoder().encode(sseChunk("error", { message: errorMessage })));
         controllerStream.close();
       }

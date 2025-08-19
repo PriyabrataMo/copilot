@@ -21,6 +21,16 @@ export async function POST(req: NextRequest) {
       model: model ?? DEFAULT_MODEL,
     },
   });
+  // Ensure a system message exists as the root
+  await prisma.message.create({
+    data: {
+      messageId: uuidv4(),
+      conversationId: created.id,
+      role: "SYSTEM",
+      content: "You are a helpful assistant.",
+      status: "COMPLETE",
+    },
+  });
   return NextResponse.json(created);
 }
 
